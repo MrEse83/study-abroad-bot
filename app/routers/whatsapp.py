@@ -1,10 +1,9 @@
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Form, Request
 from fastapi.responses import Response
-from sqlalchemy.orm import Session
-from app.database import get_db
 from app.services.ai_agent import get_agent_response, clear_memory
-from app.services.notifications import trigger_n8n_notification
+from app.services.doc_handler import handle_document
 from twilio.twiml.messaging_response import MessagingResponse
+from typing import Optional
 
 router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
 
@@ -13,37 +12,40 @@ router = APIRouter(prefix="/whatsapp", tags=["WhatsApp"])
 async def whatsapp_webhook(
     request: Request,
     From: str = Form(...),
-    Body: str = Form(...),
-    db: Session = Depends(get_db)
+    Body: str = Form(default=""),
+    NumMedia: int = Form(default=0),
+    MediaUrl0: Optional[str] = Form(default=None),
+    MediaContentType0: Optional[str] = Form(default=None),
 ):
-    patient_phone = From
-    patient_message = Body.strip()
+    student_phone = From
+    student_message = Body.strip()
 
-    print(f"Message from {patient_phone}: {patient_message}")
+    print(f"📩 Message from {student_phone}: {student_message}")
+    if NumMedia > 0:
+        print(f"📎 Media received: {MediaContentType0} — {MediaUrl0}")
 
     twiml = MessagingResponse()
 
     try:
-        reply = get_agent_response(
-            message=patient_message,
-            phone=patient_phone,
-            db=db
-        )
-
-        
-        if "confirmed" in reply.lower() and "appointment" in reply.lower():
-            await trigger_n8n_notification({
-                "phone": patient_phone.replace("whatsapp:", ""),
-                "message": reply,
-                "source": "whatsapp"
-            })
+        if NumMedia > 0 and MediaUrl0:
+            # ✅ Fixed: no db arg needed — handle_document manages its own session
+            reply = handle_document(
+                phone=student_phone,
+                media_url=MediaUrl0,
+                media_type=MediaContentType0
+            )
+        else:
+            reply = get_agent_response(
+                message=student_message,
+                phone=student_phone
+            )
 
         twiml.message(reply)
 
     except Exception as e:
-        print(f"Error processing message: {e}")
+        print(f"❌ Error processing message from {student_phone}: {e}")
         twiml.message(
-            "Sorry, I'm having trouble right now. Please try again in a moment."
+            "Sorry, I'm having trouble right now. Please try again in a moment. 🙏"
         )
 
     return Response(content=str(twiml), media_type="application/xml")
@@ -51,5 +53,8 @@ async def whatsapp_webhook(
 
 @router.post("/reset/{phone}")
 def reset_conversation(phone: str):
+    """Reset conversation memory for a student (useful for testing)."""
+    clear_memory(phone)
     clear_memory(f"whatsapp:{phone}")
+    clear_memory(f"whatsapp:+{phone}")
     return {"message": f"Conversation reset for {phone}"}
