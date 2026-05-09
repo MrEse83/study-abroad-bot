@@ -1,6 +1,7 @@
 import os
 import httpx
 from datetime import datetime
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models import Student, Document
@@ -48,8 +49,9 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
     """
     Handle incoming document from a student.
     - No content verification — consultant reviews manually
-    - Student can send up to MAX_DOCS files (one at a time via WhatsApp)
+    - Student can send multiple docs one after the other
     - Notifies consultant when MAX_DOCS are received
+    - Uses DB-level count to avoid race conditions
     """
     db: Session = SessionLocal()
 
@@ -69,12 +71,11 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
                 "so I can get you set up. 😊"
             )
 
-        # 3. Count existing docs
-        existing_docs = db.query(Document).filter(
+        # 3. Count existing docs using DB aggregate (avoids race condition)
+        doc_count = db.query(func.count(Document.id)).filter(
             Document.student_phone == phone,
             Document.status == "received"
-        ).all()
-        doc_count = len(existing_docs)
+        ).scalar() or 0
 
         if doc_count >= MAX_DOCS:
             return (
@@ -82,10 +83,12 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
                 "A consultant will reach out to you shortly! 😊"
             )
 
-        # 4. Download file
+        # 4. Download file from Twilio
         file_ext = SUPPORTED_DOCS[media_type]
         safe_phone = phone.replace("whatsapp:+", "").replace("+", "")
-        filename = f"{safe_phone}_doc{doc_count + 1}_{int(datetime.utcnow().timestamp())}.{file_ext}"
+        # Use timestamp in filename to avoid duplicates when multiple docs sent at once
+        timestamp = int(datetime.utcnow().timestamp() * 1000)  # milliseconds
+        filename = f"{safe_phone}_{timestamp}.{file_ext}"
         local_path = download_twilio_media(media_url, filename)
 
         if not local_path:
@@ -94,18 +97,25 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
                 "Please try sending it again."
             )
 
-        # 5. Save Document record with generic label
+        # 5. Save Document record — use timestamp as doc_type to avoid duplicate keys
         doc = Document(
             student_phone=phone,
-            doc_type=f"document_{doc_count + 1}",
+            doc_type=f"document_{timestamp}",
             status="received",
             submitted_at=datetime.utcnow()
         )
         db.add(doc)
-        student.last_message_at = datetime.utcnow()
-        new_count = doc_count + 1
+        db.flush()  # flush to DB before counting again
 
-        # 6. All docs received — notify consultant
+        # 6. Re-count after insert to get accurate total
+        new_count = db.query(func.count(Document.id)).filter(
+            Document.student_phone == phone,
+            Document.status == "received"
+        ).scalar() or 0
+
+        student.last_message_at = datetime.utcnow()
+
+        # 7. All docs received — notify consultant
         if new_count >= MAX_DOCS:
             student.pipeline_stage = "docs_received"
             student.needs_human = True
@@ -138,7 +148,7 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
 
         db.commit()
 
-        # 7. Acknowledge partial submission
+        # 8. Acknowledge and show progress
         remaining = MAX_DOCS - new_count
         return (
             f"✅ Document {new_count} of {MAX_DOCS} received.\n\n"
