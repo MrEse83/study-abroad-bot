@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from app.database import SessionLocal
 from app.models import Student, Document
 
-# Map content types to file extensions
+# Supported file types
 SUPPORTED_DOCS = {
     "application/pdf": "pdf",
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
@@ -13,31 +13,19 @@ SUPPORTED_DOCS = {
     "image/png": "png"
 }
 
-# Expected documents per student (in order)
-REQUIRED_DOCS = ["passport", "transcript", "ielts_result", "statement_of_finance"]
+# Max number of documents we accept per student
+MAX_DOCS = 4
 
-# Friendly names for display
-DOC_LABELS = {
-    "passport": "Passport / ID",
-    "transcript": "Academic Transcript",
-    "ielts_result": "IELTS Result",
-    "statement_of_finance": "Statement of Finance"
-}
-
-# Where to save downloaded files locally
+# Where to save downloaded files
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 def download_twilio_media(media_url: str, filename: str) -> str:
-    """
-    Download a file from Twilio's media URL (requires Basic Auth).
-    Saves it locally and returns the saved file path.
-    """
+    """Download a file from Twilio media URL with Basic Auth."""
     from app.config import TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN
 
     save_path = os.path.join(UPLOAD_DIR, filename)
-
     try:
         with httpx.Client() as client:
             response = client.get(
@@ -49,10 +37,8 @@ def download_twilio_media(media_url: str, filename: str) -> str:
             response.raise_for_status()
             with open(save_path, "wb") as f:
                 f.write(response.content)
-
         print(f"✅ File downloaded: {save_path}")
         return save_path
-
     except Exception as e:
         print(f"❌ Failed to download media: {e}")
         return None
@@ -60,24 +46,22 @@ def download_twilio_media(media_url: str, filename: str) -> str:
 
 def handle_document(phone: str, media_url: str, media_type: str) -> str:
     """
-    Handle an incoming document from a student on WhatsApp.
-    - Validates file type
-    - Checks student exists
-    - Downloads the file from Twilio
-    - Saves a Document record in the DB
-    - Notifies consultant when all docs are received
+    Handle incoming document from a student.
+    - No content verification — consultant reviews manually
+    - Student can send up to MAX_DOCS files (one at a time via WhatsApp)
+    - Notifies consultant when MAX_DOCS are received
     """
     db: Session = SessionLocal()
 
     try:
-        # --- 1. Validate file type ---
+        # 1. Validate file type
         if media_type not in SUPPORTED_DOCS:
             return (
                 "Sorry, I can only accept PDF, Word documents, or images (JPG/PNG). "
-                "Please send your document in one of those formats. 📎"
+                "Please send your documents in one of those formats. 📎"
             )
 
-        # --- 2. Check student exists ---
+        # 2. Check student exists
         student = db.query(Student).filter(Student.phone == phone).first()
         if not student:
             return (
@@ -85,27 +69,23 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
                 "so I can get you set up. 😊"
             )
 
-        # --- 3. Figure out which doc is next ---
-        submitted_docs = db.query(Document).filter(
+        # 3. Count existing docs
+        existing_docs = db.query(Document).filter(
             Document.student_phone == phone,
             Document.status == "received"
         ).all()
+        doc_count = len(existing_docs)
 
-        submitted_types = [d.doc_type for d in submitted_docs]
-        pending_docs = [d for d in REQUIRED_DOCS if d not in submitted_types]
-
-        if not pending_docs:
+        if doc_count >= MAX_DOCS:
             return (
-                "✅ We already have all your documents on file. "
-                "A consultant will be in touch with you shortly!"
+                "✅ We already have all your documents. "
+                "A consultant will reach out to you shortly! 😊"
             )
 
-        next_doc_type = pending_docs[0]
+        # 4. Download file
         file_ext = SUPPORTED_DOCS[media_type]
-
-        # --- 4. Download file from Twilio ---
         safe_phone = phone.replace("whatsapp:+", "").replace("+", "")
-        filename = f"{safe_phone}_{next_doc_type}_{int(datetime.utcnow().timestamp())}.{file_ext}"
+        filename = f"{safe_phone}_doc{doc_count + 1}_{int(datetime.utcnow().timestamp())}.{file_ext}"
         local_path = download_twilio_media(media_url, filename)
 
         if not local_path:
@@ -114,25 +94,25 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
                 "Please try sending it again."
             )
 
-        # --- 5. Save Document record in DB ---
+        # 5. Save Document record with generic label
         doc = Document(
             student_phone=phone,
-            doc_type=next_doc_type,
+            doc_type=f"document_{doc_count + 1}",
             status="received",
             submitted_at=datetime.utcnow()
         )
         db.add(doc)
+        student.last_message_at = datetime.utcnow()
+        new_count = doc_count + 1
 
-        # --- 6. Check if all docs are now received ---
-        newly_submitted = submitted_types + [next_doc_type]
-        all_received = all(d in newly_submitted for d in REQUIRED_DOCS)
-
-        if all_received:
+        # 6. All docs received — notify consultant
+        if new_count >= MAX_DOCS:
             student.pipeline_stage = "docs_received"
             student.needs_human = True
-            print(f"🎉 ALL DOCS RECEIVED for {phone} — notifying consultant")
+            db.commit()
 
-            # Build student data dict for notification
+            print(f"🎉 ALL {MAX_DOCS} DOCS RECEIVED for {phone}")
+
             student_data = {
                 "full_name": student.full_name,
                 "destination_country": student.destination_country,
@@ -143,42 +123,33 @@ def handle_document(phone: str, media_url: str, media_type: str) -> str:
                 "pipeline_stage": "docs_received"
             }
 
-            # 🚀 Notify consultant
             from app.services.escalate import notify_consultant
             notify_consultant(
                 phone=phone,
-                reason="All required documents have been submitted. Student is ready for consultation.",
+                reason=f"All {MAX_DOCS} documents received. Ready for consultant review.",
                 student_data=student_data
             )
 
-        student.last_message_at = datetime.utcnow()
+            return (
+                "✅ All documents received! Thank you.\n\n"
+                "Our consultant will review everything and reach out to you directly. "
+                "We'll be in touch soon! 🌍📚"
+            )
+
         db.commit()
 
-        # --- 7. Build reply to student ---
-        doc_label = DOC_LABELS.get(next_doc_type, next_doc_type.replace("_", " ").title())
-        remaining = [DOC_LABELS.get(d, d) for d in REQUIRED_DOCS if d not in newly_submitted]
-
-        if remaining:
-            remaining_list = "\n".join([f"• {d}" for d in remaining])
-            return (
-                f"✅ Got your *{doc_label}* — thank you!\n\n"
-                f"📋 Still needed:\n{remaining_list}\n\n"
-                f"Please send them one at a time when you're ready. 😊"
-            )
-        else:
-            return (
-                f"✅ Got your *{doc_label}*.\n\n"
-                f"🎉 That's everything! All your documents have been received.\n\n"
-                f"A consultant will review your profile and reach out to you shortly. "
-                f"We'll be in touch soon! 🌍📚"
-            )
+        # 7. Acknowledge partial submission
+        remaining = MAX_DOCS - new_count
+        return (
+            f"✅ Document {new_count} of {MAX_DOCS} received.\n\n"
+            f"Please send the remaining {remaining} document{'s' if remaining > 1 else ''}. "
+            f"You can send them one after the other. 😊"
+        )
 
     except Exception as e:
         print(f"❌ Error in handle_document: {e}")
-        return (
-            "Sorry, something went wrong while saving your document. "
-            "Please try again in a moment."
-        )
+        db.rollback()
+        return "Sorry, something went wrong. Please try again in a moment."
 
     finally:
         db.close()

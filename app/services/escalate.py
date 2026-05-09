@@ -5,17 +5,13 @@ import os
 # Consultant's WhatsApp number
 CONSULTANT_NUMBER = "whatsapp:+2349075057294"
 
-# Your app base URL — set this in your .env when you deploy
-# e.g. BASE_URL=https://yourdomain.com
-BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
+# Your app base URL — must be set in Railway Variables
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000").rstrip("/")
 
 
 def notify_consultant(phone: str, reason: str, student_data: dict):
     """
     Send a WhatsApp alert to the consultant when a student needs human attention.
-    Triggered by:
-    - escalate_to_human tool (student frustrated / ready to apply / unknown question)
-    - All documents received (pipeline_stage = docs_received)
     """
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
@@ -28,13 +24,13 @@ def notify_consultant(phone: str, reason: str, student_data: dict):
         ielts = student_data.get("ielts_score") or "Not taken"
         stage = student_data.get("pipeline_stage") or "new"
 
-        # Clean phone for URL (remove whatsapp: prefix and + sign)
-        clean_phone = phone.replace("whatsapp:", "").replace("+", "")
+        # Clean phone for URL
+        clean_phone = phone.replace("whatsapp:+", "").replace("whatsapp:", "").replace("+", "")
 
-        # Profile link — will be live once dashboard is built
+        # Plain URL — WhatsApp makes plain URLs clickable automatically
         profile_url = f"{BASE_URL}/dashboard/student/{clean_phone}"
 
-        # Pick header and urgency based on pipeline stage
+        # Header based on stage
         if stage == "docs_received":
             header = "📁 *All Documents Received — Ready for Review*"
             urgency = "🟢"
@@ -56,9 +52,9 @@ def notify_consultant(phone: str, reason: str, student_data: dict):
             f"📝 *IELTS:* {ielts}\n"
             f"📊 *Stage:* {stage}\n\n"
             f"{urgency} *Reason:* {reason}\n\n"
-            f"🔗 *View Full Profile & Documents:*\n"
+            f"🔗 View Full Profile & Documents:\n"
             f"{profile_url}\n\n"
-            f"Please review and follow up with this student directly. 🙏"
+            f"Please follow up with this student directly. 🙏"
         )
 
         client.messages.create(
